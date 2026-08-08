@@ -1,9 +1,10 @@
 """
 TeleDirectory Phase 0 — Telegram bot handlers.
-All /commands, inline queries, and callback queries.
+Auto-monitor channels + search + watchlist.
 """
 
 import html
+import re
 from telegram import (
     Update,
     InlineQueryResultArticle,
@@ -30,52 +31,116 @@ def _is_operator(user_id: int) -> bool:
 
 
 def _deep_link(channel: str, msg_id: int) -> str:
-    """Build t.me/channel/msg_id link."""
     return f"{TELEGRAM_LINK_BASE}/{channel}/{msg_id}"
 
 
+def _extract_price(text: str) -> str:
+    """Pull a price from messy Ethiopian commerce text."""
+    if not text:
+        return ""
+    patterns = [
+        r'[Pp]rice[:\s-]*(\d[\d,\.]*)\s*(birr|etb|br|ብር|\$)?',
+        r'(\d[\d,\.]*)\s*(birr|etb|br|ብር)',
+        r'(\d[\d,\.]*)\s*(?:birr|etb|br)',
+        r'ETB\s*(\d[\d,\.]*)',
+        r'(\d{2,3},?\d{3})',  # 32,000 or 70000
+    ]
+    for p in patterns:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            return m.group(0).strip()
+    return ""
+
+
+def _extract_phone(text: str) -> str:
+    """Pull Ethiopian phone numbers from text."""
+    if not text:
+        return ""
+    m = re.findall(r'(?:\+251|0)[97]\d{8}', text)
+    return m[0] if m else ""
+
+
+def _extract_telegram_user(text: str) -> str:
+    """Pull @username mentions from text."""
+    if not text:
+        return ""
+    m = re.findall(r'@(\w{4,})', text)
+    # Filter out channel names (usually have underscores and long names)
+    return f"@{m[0]}" if m else ""
+
+
+def _extract_title(text: str) -> str:
+    """Get a clean title from the first meaningful line."""
+    if not text:
+        return "Untitled"
+    lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
+    for line in lines[:3]:
+        # Skip lines that are just emojis or numbers
+        clean = re.sub(r'[^\w\s]', '', line).strip()
+        if len(clean) > 3:
+            return line[:100]
+    return lines[0][:100] if lines else "Untitled"
+
+
 def _listing_card(listing: dict, show_id: bool = False) -> str:
-    """Render a listing as a short text block (Telegram-safe, no markdown tables)."""
     lines = []
     if show_id:
         lines.append(f"🆔 #{listing['id']}")
     lines.append(f"📱 <b>{html.escape(listing['title'])}</b>")
-    if listing["price"]:
+    if listing.get("price"):
         lines.append(f"💰 {html.escape(listing['price'])}")
-    if listing["category"]:
-        lines.append(f"🏷 {html.escape(listing['category'])}")
+    if listing.get("phone"):
+        lines.append(f"📞 {html.escape(listing['phone'])}")
+    if listing.get("username_mention"):
+        lines.append(f"💬 {html.escape(listing['username_mention'])}")
     lines.append(f"📣 @{html.escape(listing['channel_username'])}")
     return "\n".join(lines)
 
 
 def _listing_keyboard(listing: dict) -> InlineKeyboardMarkup:
-    """Inline keyboard with 'View Original Post' deep-link button."""
     url = _deep_link(listing["channel_username"], listing["message_id"])
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔗 View Original Post", url=url)],
-    ])
+    buttons = [[InlineKeyboardButton("🔗 View Original Post", url=url)]]
+    if listing.get("username_mention"):
+        contact = listing["username_mention"].lstrip("@")
+        buttons.append([InlineKeyboardButton("💬 Message Seller", url=f"https://t.me/{contact}")])
+    elif listing.get("phone"):
+        buttons.append([InlineKeyboardButton("📞 Call Seller", url=f"tel:{listing['phone']}")])
+    return InlineKeyboardMarkup(buttons)
 
 
 # ── /start ────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome = (
-        "📱 <b>TeleDirectory</b>\n\n"
-        "Find fresh electronics listings in Addis Ababa.\n\n"
-        "🔍 <b>Search:</b> /search <i>keyword</i>\n"
-        "🔔 <b>Watch:</b> /watch <i>keyword</i>  — get alerts on new matches\n"
-        "📋 <b>My watches:</b> /mywatches\n\n"
-        "Or use inline: type <code>@botname iphone</code> in any chat.\n"
-    )
-    if _is_operator(update.effective_user.id):
-        welcome += (
-            "\n── Operator commands ──\n"
-            "/add &lt;channel&gt; &lt;msg_id&gt; &lt;title&gt; [price]\n"
-            "/list — show active listings\n"
-            "/remove &lt;id&gt; — hide a listing\n"
+    is_op = _is_operator(update.effective_user.id)
+
+    if is_op:
+        welcome = (
+            "📱 <b>TeleDirectory — Operator Mode</b>\n\n"
+            "The bot <b>automatically monitors</b> channels you add.\n\n"
+            "<b>Setup:</b>\n"
+            "1. Add this bot as <b>admin</b> to your channel\n"
+            "2. Send /monitor @channel_username here\n"
+            "3. Done — every new post is auto-indexed\n\n"
+            "<b>Commands:</b>\n"
+            "/monitor @channel — start watching a channel\n"
+            "/unmonitor @channel — stop watching\n"
+            "/channels — see monitored channels\n"
+            "/list — see all active listings\n"
             "/sold &lt;id&gt; — mark as sold\n"
-            "/stats — counters\n"
+            "/remove &lt;id&gt; — delete a listing\n"
+            "/stats — counters\n\n"
+            "<b>Buyers:</b> just type a word to search (e.g. <i>iphone</i>)"
         )
+    else:
+        welcome = (
+            "📱 <b>TeleDirectory</b>\n\n"
+            "Find fresh electronics listings in Addis Ababa.\n\n"
+            "🔍 Just type what you're looking for\n"
+            "   e.g. <i>iphone</i>, <i>samsung</i>, <i>laptop</i>\n\n"
+            "🔔 /watch keyword — get alerts when new matches arrive\n"
+            "📋 /mywatches — see your watches\n"
+        )
+
     await update.message.reply_text(welcome, parse_mode=ParseMode.HTML)
 
 
@@ -83,7 +148,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /search <keyword>\nExample: /search iphone 15")
+        await update.message.reply_text("Usage: /search <keyword>\nOr just type a keyword directly.")
         return
 
     query = " ".join(context.args)
@@ -95,11 +160,9 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        f'🔍 <b>{len(results)} result(s) for "{html.escape(query)}"</b>\n'
-        f"Tap a listing to view the original post.",
+        f'🔍 <b>{len(results)} result(s) for "{html.escape(query)}"</b>',
         parse_mode=ParseMode.HTML,
     )
-
     for listing in results:
         await update.message.reply_text(
             _listing_card(listing),
@@ -114,15 +177,14 @@ async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
             "Usage: /watch <keyword>\n"
-            "I'll DM you when a matching listing is added.\n"
-            "Example: /watch samsung galaxy"
+            "I'll DM you when a matching listing appears.\n"
+            "Example: /watch iphone 15"
         )
         return
 
     user_id = update.effective_user.id
     query = " ".join(context.args)
 
-    # Check limit
     current = db.get_user_watches(user_id)
     if len(current) >= MAX_WATCHLIST_PER_USER:
         await update.message.reply_text(
@@ -168,189 +230,150 @@ async def cmd_mywatches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
-# ── Operator: /add ────────────────────────────────────────
+# ── Operator: /monitor / /unmonitor / /channels ───────────
 
-async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not _is_operator(uid):
+async def cmd_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_operator(update.effective_user.id):
         await update.message.reply_text("⛔ Operator-only command.")
         return
 
-    # Expected: /add @channel 12345 Title here 85,000 Birr
-    # or:     /add channel 12345 Title here 85,000 Birr
-    if len(context.args) < 3:
+    if not context.args:
         await update.message.reply_text(
-            "Usage: /add <channel> <msg_id> <title> [price]\n"
-            "Example: /add @BoleElectronics 12345 iPhone 15 Pro Max 85000 Birr\n\n"
-            "Tip: You can also forward a post from a cooperating channel "
-            "and I'll try to extract the info automatically."
+            "Usage: /monitor @channel_username\n\n"
+            "Steps:\n"
+            "1. Add this bot as admin to the channel\n"
+            "2. Send /monitor @channel_username here\n\n"
+            "The bot will auto-index every new post."
         )
         return
 
     channel = context.args[0].lstrip("@")
-    try:
-        msg_id = int(context.args[1])
-    except ValueError:
-        await update.message.reply_text("Message ID must be a number.")
+    existing = db.get_channel(channel)
+
+    if existing and existing["is_active"]:
+        await update.message.reply_text(f"Already monitoring @{channel}.")
         return
 
-    # Title is everything between msg_id and the last arg (if it looks like a price)
-    # Simple heuristic: if the last token has digits and a price word, treat as price
-    remaining = context.args[2:]
-    price = ""
-    title_parts = list(remaining)
-
-    # Check if last 1-2 tokens look like a price (digits + optional currency)
-    if len(remaining) >= 2:
-        last_two = " ".join(remaining[-2:])
-        last_one = remaining[-1]
-        if any(c.isdigit() for c in last_one) and len(last_one) < 15:
-            # Could be price — but only if there's more than just a "title"
-            if any(word.lower() in last_two.lower() for word in ["birr", "etb", "br", "price"]):
-                price = last_two
-                title_parts = remaining[:-2]
-            elif len(remaining) >= 3 and any(c.isdigit() for c in last_one):
-                price = last_one
-                title_parts = remaining[:-1]
-
-    title = " ".join(title_parts) or channel  # fallback to channel name
-
-    try:
-        listing_id = db.add_listing(
-            channel_username=channel,
-            message_id=msg_id,
-            title=title,
-            price=price,
-            added_by=uid,
-        )
-    except Exception as e:
-        if "UNIQUE" in str(e):
-            await update.message.reply_text(
-                f"Already added: @{channel}/{msg_id}"
-            )
-        else:
-            await update.message.reply_text(f"Error: {e}")
-        return
-
-    # Notify matching watchers
-    watcher_ids = db.get_matching_watchers(title, price)
-    for wid in watcher_ids:
-        try:
-            await context.bot.send_message(
-                chat_id=wid,
-                text=(
-                    f"🔔 <b>New listing matches your watch!</b>\n\n"
-                    f"{_listing_card(db.get_listing(listing_id))}\n"
-                ),
-                parse_mode=ParseMode.HTML,
-                reply_markup=_listing_keyboard(db.get_listing(listing_id)),
-            )
-        except Exception:
-            pass  # user may have blocked the bot
-
+    db.add_channel(channel, added_by=update.effective_user.id)
     await update.message.reply_text(
-        f"✅ Added #{listing_id}: <b>{html.escape(title)}</b>\n"
-        f"🔗 {_deep_link(channel, msg_id)}\n"
-        f"Notified {len(watcher_ids)} watcher(s).",
+        f"✅ Now monitoring <b>@{html.escape(channel)}</b>\n\n"
+        f"⚠️ Make sure this bot is an <b>admin</b> in the channel!\n"
+        f"New posts will be auto-indexed.",
         parse_mode=ParseMode.HTML,
     )
 
 
-# ── Operator: /forward_add (handle forwarded posts) ──────
+async def cmd_unmonitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_operator(update.effective_user.id):
+        await update.message.reply_text("⛔ Operator-only command.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /unmonitor @channel")
+        return
 
-async def cmd_forward_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Use when operator forwards a channel post to the bot.
-    Bot extracts info from the forwarded message."""
-    uid = update.effective_user.id
-    if not _is_operator(uid):
+    channel = context.args[0].lstrip("@")
+    if db.remove_channel(channel):
+        await update.message.reply_text(f"Stopped monitoring @{channel}.")
+    else:
+        await update.message.reply_text(f"@{channel} wasn't being monitored.")
+
+
+async def cmd_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_operator(update.effective_user.id):
         await update.message.reply_text("⛔ Operator-only command.")
         return
 
-    msg = update.message
-    fwd = msg.forward_origin  # v20+ uses forward_origin
-
-    if not fwd:
+    channels = db.get_channels()
+    if not channels:
         await update.message.reply_text(
-            "Forward a post from a cooperating channel, then reply /forward_add to it.\n"
-            "Or use: /add <channel> <msg_id> <title> [price]"
+            "No channels being monitored.\n"
+            "Use /monitor @channel to add one."
         )
         return
 
-    # Extract channel info from forward_origin
-    channel_username = ""
-    message_id = 0
-
-    if hasattr(fwd, "chat") and fwd.chat:
-        # Forwarded from a channel
-        channel_username = fwd.chat.username or ""
-        message_id = fwd.message_id if hasattr(fwd, "message_id") else 0
-    elif hasattr(fwd, "sender_user_name"):
-        # Forwarded from a user — not what we want
-        await update.message.reply_text(
-            "This looks like it was forwarded from a user, not a channel.\n"
-            "Forward a post from a cooperating electronics channel."
+    lines = [f"📡 <b>{len(channels)} monitored channel(s):</b>\n"]
+    for ch in channels:
+        lines.append(
+            f"  @{html.escape(ch['channel_username'])} — "
+            f"{ch['post_count']} posts"
+            f"{'  ⚠️ bot not admin' if ch['post_count'] == 0 else ''}"
         )
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+# ── Channel post handler (auto-index) ─────────────────────
+
+async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Auto-index new posts from monitored channels.
+    This fires when the bot is an admin in a channel and a new post appears."""
+    post = update.channel_post
+    if not post:
         return
+
+    # Get channel username
+    chat = post.chat
+    channel_username = (chat.username or "").lower()
 
     if not channel_username:
-        await update.message.reply_text(
-            "Could not extract channel username from this forward.\n"
-            "Use /add manually: /add @channel 123 Title"
-        )
         return
 
-    # Try to extract title and price from the forwarded message text
-    text = msg.text or msg.caption or ""
-    lines = text.strip().split("\n")
-    title = lines[0][:100] if lines else channel_username
+    # Check if we're monitoring this channel
+    if not db.get_channel(channel_username):
+        return
 
-    # Simple price extraction
-    price = ""
-    import re
-    price_match = re.search(r'(\d[\d,\.]*)\s*(birr|etb|br|ብር)?', text, re.IGNORECASE)
-    if price_match:
-        price = price_match.group(0).strip()
+    # Skip if already indexed
+    if db.listing_exists(channel_username, post.message_id):
+        return
 
+    # Extract data from the post
+    text = post.text or post.caption or ""
+    title = _extract_title(text)
+    price = _extract_price(text)
+    phone = _extract_phone(text)
+    tg_user = _extract_telegram_user(text)
+
+    # Get image URL if present
+    image_url = ""
+    if post.photo:
+        # Get the largest photo
+        photo = post.photo[-1]
+        image_url = photo.file_id  # We'll use file_id for now
+
+    # Store the listing
     try:
         listing_id = db.add_listing(
             channel_username=channel_username,
-            message_id=message_id,
+            message_id=post.message_id,
             title=title,
             price=price,
-            added_by=uid,
+            description=text,
+            image_url=image_url,
+            phone=phone,
+            username_mention=tg_user,
         )
-    except Exception as e:
-        if "UNIQUE" in str(e):
-            await update.message.reply_text(
-                f"Already added: @{channel_username}/{message_id}"
-            )
-        else:
-            await update.message.reply_text(f"Error: {e}")
-        return
+    except Exception:
+        return  # Duplicate or error, skip silently
 
-    # Notify watchers
-    watcher_ids = db.get_matching_watchers(title, price)
+    # Update channel post count
+    db.update_channel_post_count(channel_username)
+
+    # Notify matching watchers
+    watcher_ids = db.get_matching_watchers(title, text)
+    listing = db.get_listing(listing_id)
+
     for wid in watcher_ids:
         try:
             await context.bot.send_message(
                 chat_id=wid,
                 text=(
                     f"🔔 <b>New listing matches your watch!</b>\n\n"
-                    f"{_listing_card(db.get_listing(listing_id))}\n"
+                    f"{_listing_card(listing)}\n"
                 ),
                 parse_mode=ParseMode.HTML,
-                reply_markup=_listing_keyboard(db.get_listing(listing_id)),
+                reply_markup=_listing_keyboard(listing),
             )
         except Exception:
             pass
-
-    await update.message.reply_text(
-        f"✅ Added #{listing_id} from @{channel_username}/{message_id}\n"
-        f"<b>{html.escape(title)}</b>"
-        f"{' | ' + html.escape(price) if price else ''}\n"
-        f"Notified {len(watcher_ids)} watcher(s).",
-        parse_mode=ParseMode.HTML,
-    )
 
 
 # ── Operator: /list / /remove / /sold / /stats ───────────
@@ -369,7 +392,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for l in listings:
         clicks = db.get_clicks_for_listing(l["id"])
         lines.append(
-            f"#{l['id']} — {html.escape(l['title'])}"
+            f"#{l['id']} — {html.escape(l['title'][:40])}"
             f"{(' | ' + html.escape(l['price'])) if l['price'] else ''}"
             f" | @{html.escape(l['channel_username'])}"
             f" | {clicks} click(s)"
@@ -425,6 +448,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = db.get_stats()
     await update.message.reply_text(
         f"📊 <b>Stats</b>\n\n"
+        f"📡 Monitored channels: {s['channels']}\n"
         f"📦 Active listings: {s['active']}\n"
         f"🏷 Total (incl. sold/removed): {s['total_listings']}\n"
         f"✅ Sold: {s['sold']}\n"
@@ -438,7 +462,6 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Inline query ──────────────────────────────────────────
 
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle @botname <query> inline searches."""
     query = update.inline_query.query.strip()
     if not query or len(query) < 2:
         return
@@ -457,10 +480,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 title=f"📱 {listing['title']}",
                 description=f"{listing['price'] or ''} — @{listing['channel_username']}",
                 input_message_content=InputTextMessageContent(
-                    message_text=(
-                        f"{card_text}\n\n"
-                        f"🔗 <a href=\"{url}\">View Original Post</a>"
-                    ),
+                    message_text=f"{card_text}\n\n🔗 <a href=\"{url}\">View Original Post</a>",
                     parse_mode=ParseMode.HTML,
                 ),
                 reply_markup=InlineKeyboardMarkup([
@@ -480,7 +500,6 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Callback query (click tracking) ──────────────────────
 
 async def callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Track button clicks if we ever add tracking buttons."""
     query = update.callback_query
     data = query.data or ""
 
@@ -493,3 +512,34 @@ async def callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer()
     else:
         await query.answer()
+
+
+# ── Plain text search (type anything → search) ───────────
+
+async def plain_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """If someone types text (not a command), search for it."""
+    text = update.message.text.strip()
+    if not text or len(text) < 2:
+        return
+
+    results = db.search_listings(text, limit=MAX_SEARCH_RESULTS)
+    db.log_search(update.effective_user.id, text, len(results))
+
+    if not results:
+        await update.message.reply_text(
+            f'No results for "{html.escape(text)}".\n'
+            f'Try a different keyword.',
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await update.message.reply_text(
+        f'🔍 <b>{len(results)} result(s) for "{html.escape(text)}"</b>',
+        parse_mode=ParseMode.HTML,
+    )
+    for listing in results:
+        await update.message.reply_text(
+            _listing_card(listing),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_listing_keyboard(listing),
+        )

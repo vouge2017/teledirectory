@@ -1,15 +1,33 @@
 """
 TeleDirectory Phase 0 — Configuration
-All settings in one place. No env-var spelunking.
+Supports .env file.
 """
 
 import os
+from pathlib import Path
+
+
+def _load_env():
+    env_path = Path(__file__).parent / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip()
+            if k and k not in os.environ:
+                os.environ[k] = v
+
+
+_load_env()
 
 # ── Telegram ──────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("TELEDIRECTORY_BOT_TOKEN", "")
 
-# Telegram user IDs allowed to run operator commands (/add, /remove, /mark_sold)
-# Comma-separated in env, e.g. "123456,789012"
+# Operator Telegram user IDs (comma-separated)
 _raw_ops = os.environ.get("TELEDIRECTORY_OPERATOR_IDS", "")
 OPERATOR_IDS: set[int] = set()
 for _s in _raw_ops.split(","):
@@ -21,12 +39,9 @@ for _s in _raw_ops.split(","):
 DB_PATH = os.environ.get("TELEDIRECTORY_DB", "teledirectory.db")
 
 # ── Limits ────────────────────────────────────────────────
-MAX_SEARCH_RESULTS = 10        # per /search or inline query
-MAX_WATCHLIST_PER_USER = 20    # cap per buyer
-LISTING_MAX_AGE_DAYS = 30      # auto-hide listings older than this
-INLINE_CACHE_TIME = 300        # seconds — Telegram caches inline results
+MAX_SEARCH_RESULTS = 10
+MAX_WATCHLIST_PER_USER = 20
+LISTING_MAX_AGE_DAYS = 30
 
-# ── Deep link base ────────────────────────────────────────
-# For t.me links the bot builds automatically; no config needed.
-# But if channels have custom domain, set here:
+# ── Deep link ─────────────────────────────────────────────
 TELEGRAM_LINK_BASE = "https://t.me"
